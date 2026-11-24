@@ -1534,7 +1534,7 @@ export class TicketsService {
    * case-insensitive compare here just mirrors that at the service layer.
    */
   private async assertSeatAvailable(eventId: string, seat?: string) {
-    const normalized = seat?.trim() ?? UNASSIGNED_SEAT;
+    const normalized = seat?.trim().toUpperCase() ?? UNASSIGNED_SEAT;
     if (!normalized || normalized.toLowerCase() === UNASSIGNED_SEAT) return;
     const existing = await this.prisma.ticket.findFirst({
       where: { eventId, seat: normalized },
