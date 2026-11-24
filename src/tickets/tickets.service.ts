@@ -278,13 +278,7 @@ export class TicketsService {
     const { ticketType, event } =
       await this.getTicketTypeWithEvent(ticketTypeId);
     this.assertHasCapacity(ticketType.quantityIssued, ticketType.quantityTotal);
-    if (event.status !== EventStatus.PUBLISHED || event.chainEventId === null) {
-      throw new BadRequestException(
-        event.status === EventStatus.CANCELLED
-          ? 'Event has been cancelled'
-          : 'Event has not been published on-chain yet',
-      );
-    }
+    this.assertPurchasable(event, ticketType, promoCode);
     const buyer = await this.getUserWithWallet(buyerId);
     // The on-chain tier price is the contract's source of truth after #127;
     // still validate a promo code here so an invalid one fails at build time.
@@ -317,7 +311,21 @@ export class TicketsService {
       await this.getTicketTypeWithEvent(ticketTypeId);
     const replay = await this.findProcessedTx<Ticket>(signedXdr);
     if (replay) return replay.value;
+    // #508 — a transaction built before the event was cancelled, unpublished
+    // or its sale window closed must not be recorded: re-run the build-time
+    // guards against the current state before submitting.
+    this.assertPurchasable(event, ticketType, promoCode);
     const buyer = await this.getUserWithWallet(buyerId);
+    // #506 — fail before touching the chain if the promo can no longer be
+    // redeemed by this buyer; the atomic redemption below is the final word.
+    if (promoCode) {
+      await this.promoCodes!.validate(
+        event.id,
+        buyerId,
+        promoCode,
+        ticketType.price,
+      );
+    }
     // #377 — the DB row must describe the ticket the chain will mint.
     this.assertSignedInvocation(signedXdr, 'purchase_primary', [
       ['buyer', 0, buyer.stellarPublicKey],
@@ -349,7 +357,7 @@ export class TicketsService {
         }
         this.assertHasCapacity(row.quantityIssued, row.quantityTotal);
 
-        return this.recordIssuedTicket(tx, {
+        const issued = await this.recordIssuedTicket(tx, {
           eventId: event.id,
           ticketTypeId,
           ownerId: buyerId,
@@ -359,6 +367,18 @@ export class TicketsService {
           signedXdr,
           operation: 'purchase',
         });
+        // #506 — the redemption commits or rolls back with the ticket: the
+        // promo row is locked and re-validated inside this transaction.
+        if (promoCode) {
+          await this.promoCodes!.redeem(
+            event.id,
+            buyerId,
+            promoCode,
+            issued.id,
+            tx,
+          );
+        }
+        return issued;
       });
     } catch (err) {
       this.throwOnSeatConflict(err);
@@ -1602,6 +1622,34 @@ export class TicketsService {
           'This ticket already has an active resale listing',
         );
       }
+    }
+  }
+
+  /**
+   * Attendee purchase guards, shared by build and confirm (#508, #509): the
+   * event is published on-chain and not cancelled, the ticket type's sale
+   * window is open, and a hidden ticket type is only sold with a promo code
+   * (which the caller validates).
+   */
+  private assertPurchasable<C extends bigint | number>(
+    event: { status: EventStatus; chainEventId: C | null },
+    ticketType: {
+      saleStartsAt: Date | null;
+      saleEndsAt: Date | null;
+      isHidden: boolean;
+    },
+    promoCode?: string,
+  ): asserts event is { status: EventStatus; chainEventId: C } {
+    if (event.status !== EventStatus.PUBLISHED || event.chainEventId === null) {
+      throw new BadRequestException(
+        event.status === EventStatus.CANCELLED
+          ? 'Event has been cancelled'
+          : 'Event has not been published on-chain yet',
+      );
+    }
+    this.assertSaleWindow(ticketType.saleStartsAt, ticketType.saleEndsAt);
+    if (ticketType.isHidden && !promoCode?.trim()) {
+      throw new NotFoundException('Ticket type not found');
     }
   }
 

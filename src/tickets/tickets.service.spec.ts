@@ -180,6 +180,28 @@ describe('TicketsService', () => {
     );
   });
 
+  /** The service with a PromoCodesService double (#506, #509). */
+  function serviceWithPromoCodes(promoCodes: {
+    validate: jest.Mock;
+    redeem: jest.Mock;
+  }) {
+    return new TicketsService(
+      prisma as unknown as PrismaService,
+      organizations as unknown as OrganizationsService,
+      stellar as unknown as StellarService,
+      undefined,
+      offlineTokens as unknown as OfflineTokenService,
+      config as unknown as ConfigService,
+      promoCodes as never,
+      undefined,
+      undefined,
+      undefined,
+      qrTokens as unknown as QrTokenService,
+    );
+  }
+
+  const HOUR = 60 * 60 * 1000;
+
   /** Makes the signed envelope decode to `functionName(...args)` (#375-#377). */
   function mockSignedCall(functionName: string, args: unknown[]) {
     stellar.decodeSignedInvocation.mockReturnValue({ functionName, args });
@@ -424,6 +446,100 @@ describe('TicketsService', () => {
         chainEventId: 42n,
         tier: 'GA',
         seat: UNASSIGNED_SEAT,
+      });
+    });
+
+    describe('ticket type sale window and hidden flag (#509)', () => {
+      beforeEach(() => {
+        prisma.user.findUnique.mockResolvedValue(
+          createUser({ id: 'buyer-1', stellarPublicKey: 'GBUYER' }),
+        );
+      });
+
+      it.each([
+        [
+          'has not started',
+          { saleStartsAt: new Date(Date.now() + HOUR) },
+          'Ticket sales have not started',
+        ],
+        [
+          'has ended',
+          { saleEndsAt: new Date(Date.now() - HOUR) },
+          'Ticket sales have ended',
+        ],
+      ])(
+        'rejects a purchase when the sale window %s',
+        async (_label, window, message) => {
+          prisma.ticketType.findUnique.mockResolvedValue(
+            buildTicketType(window),
+          );
+
+          await expect(
+            service.buildPurchaseTx('buyer-1', 'tt-1'),
+          ).rejects.toThrow(new BadRequestException(message));
+          expect(stellar.buildPurchasePrimaryTx).not.toHaveBeenCalled();
+        },
+      );
+
+      it('rejects a hidden ticket type bought by id without a promo code', async () => {
+        prisma.ticketType.findUnique.mockResolvedValue(
+          buildTicketType({ isHidden: true }),
+        );
+
+        await expect(
+          service.buildPurchaseTx('buyer-1', 'tt-1'),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        expect(stellar.buildPurchasePrimaryTx).not.toHaveBeenCalled();
+      });
+
+      it('sells a hidden ticket type with a valid promo code', async () => {
+        prisma.ticketType.findUnique.mockResolvedValue(
+          buildTicketType({ isHidden: true }),
+        );
+        const promoCodes = {
+          validate: jest.fn().mockResolvedValue({ discountedPrice: 800n }),
+          redeem: jest.fn(),
+        };
+
+        await expect(
+          serviceWithPromoCodes(promoCodes).buildPurchaseTx(
+            'buyer-1',
+            'tt-1',
+            undefined,
+            'INSIDER',
+          ),
+        ).resolves.toEqual({ unsignedXdr: 'unsigned-xdr' });
+        expect(promoCodes.validate).toHaveBeenCalledWith(
+          'event-1',
+          'buyer-1',
+          'INSIDER',
+          1_000n,
+        );
+        expect(stellar.buildPurchasePrimaryTx).toHaveBeenCalledWith(
+          expect.objectContaining({ price: 800n }),
+        );
+      });
+
+      it('rejects a hidden ticket type when the promo code is invalid', async () => {
+        prisma.ticketType.findUnique.mockResolvedValue(
+          buildTicketType({ isHidden: true }),
+        );
+        const promoCodes = {
+          validate: jest
+            .fn()
+            .mockRejectedValue(new BadRequestException('Invalid promo code')),
+          redeem: jest.fn(),
+        };
+
+        await expect(
+          serviceWithPromoCodes(promoCodes).buildPurchaseTx(
+            'buyer-1',
+            'tt-1',
+            undefined,
+            'NOPE',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(stellar.buildPurchasePrimaryTx).not.toHaveBeenCalled();
       });
     });
   });
@@ -692,6 +808,146 @@ describe('TicketsService', () => {
       ).resolves.toMatchObject({ seat: 'unassigned' });
     });
 
+    describe('re-checks the event and ticket type at confirm time (#508)', () => {
+      it('rejects a purchase signed before the event was cancelled', async () => {
+        prisma.ticketType.findUnique.mockResolvedValue(
+          buildTicketType({
+            event: {
+              ...buildTicketType().event,
+              status: 'CANCELLED',
+              chainEventId: 42n,
+            },
+          }),
+        );
+        mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 1_000n]);
+
+        await expect(
+          service.confirmPurchase('buyer-1', 'tt-1', 'A1', 'signed-xdr'),
+        ).rejects.toThrow(new BadRequestException('Event has been cancelled'));
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+        expect(prisma.ticket.create).not.toHaveBeenCalled();
+      });
+
+      it('rejects a purchase signed before the sale window closed', async () => {
+        prisma.ticketType.findUnique.mockResolvedValue(
+          buildTicketType({ saleEndsAt: new Date(Date.now() - HOUR) }),
+        );
+        mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 1_000n]);
+
+        await expect(
+          service.confirmPurchase('buyer-1', 'tt-1', 'A1', 'signed-xdr'),
+        ).rejects.toThrow(new BadRequestException('Ticket sales have ended'));
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+      });
+
+      it('rejects a hidden ticket type confirmed without a promo code', async () => {
+        prisma.ticketType.findUnique.mockResolvedValue(
+          buildTicketType({ isHidden: true }),
+        );
+        mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 1_000n]);
+
+        await expect(
+          service.confirmPurchase('buyer-1', 'tt-1', 'A1', 'signed-xdr'),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('promo redemption is atomic with the ticket (#506)', () => {
+      it('redeems inside the ticket transaction with its client', async () => {
+        mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 800n]);
+        const promoCodes = {
+          validate: jest.fn().mockResolvedValue({ discountedPrice: 800n }),
+          redeem: jest.fn().mockResolvedValue({ id: 'r-1' }),
+        };
+
+        const ticket = await serviceWithPromoCodes(promoCodes).confirmPurchase(
+          'buyer-1',
+          'tt-1',
+          'A1',
+          'signed-xdr',
+          'SAVE20',
+        );
+
+        expect(promoCodes.redeem).toHaveBeenCalledWith(
+          'event-1',
+          'buyer-1',
+          'SAVE20',
+          ticket.id,
+          prisma,
+        );
+        expect(prisma.$transaction).toHaveBeenCalled();
+      });
+
+      it('does not record the ticket when the redemption fails inside the transaction', async () => {
+        mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 800n]);
+        const committed: unknown[] = [];
+        // A transaction that only commits writes when its callback succeeds.
+        prisma.$transaction.mockImplementation(
+          async (cb: (tx: unknown) => unknown) => {
+            const pending: unknown[] = [];
+            const tx = {
+              ...prisma,
+              ticket: {
+                ...prisma.ticket,
+                create: jest.fn(async ({ data }) => {
+                  const row = { id: 'ticket-1', ...data };
+                  pending.push(row);
+                  return row;
+                }),
+              },
+            };
+            const result = await cb(tx);
+            committed.push(...pending);
+            return result;
+          },
+        );
+        const promoCodes = {
+          validate: jest.fn().mockResolvedValue({ discountedPrice: 800n }),
+          redeem: jest
+            .fn()
+            .mockRejectedValue(
+              new BadRequestException(
+                'This promo code has reached its redemption limit',
+              ),
+            ),
+        };
+
+        await expect(
+          serviceWithPromoCodes(promoCodes).confirmPurchase(
+            'buyer-1',
+            'tt-1',
+            'A1',
+            'signed-xdr',
+            'SAVE20',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(committed).toHaveLength(0);
+      });
+
+      it('fails before submitting when the promo can no longer be used', async () => {
+        mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 800n]);
+        const promoCodes = {
+          validate: jest
+            .fn()
+            .mockRejectedValue(
+              new BadRequestException('You have already used this promo code'),
+            ),
+          redeem: jest.fn(),
+        };
+
+        await expect(
+          serviceWithPromoCodes(promoCodes).confirmPurchase(
+            'buyer-1',
+            'tt-1',
+            'A1',
+            'signed-xdr',
+            'SAVE20',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+        expect(promoCodes.redeem).not.toHaveBeenCalled();
+      });
     it('marks waitlist entry CONVERTED on purchase if waitlist service is provided', async () => {
       mockSignedCall('purchase_primary', ['GBUYER', 42n, 'GA', 'A1', 1_000n]);
       const waitlist = {
