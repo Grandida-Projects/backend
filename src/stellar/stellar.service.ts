@@ -319,6 +319,47 @@ export class StellarService {
     ]);
   }
 
+  /**
+   * #515 — lets `signerPublicKey` (a scanner device's own key) sign
+   * `check_in` for the event, so gates don't hold the organizer key.
+   */
+  buildAddCheckinSignerTx(params: {
+    organizerPublicKey: string;
+    chainEventId: bigint;
+    signerPublicKey: string;
+  }): Promise<string> {
+    return this.buildTx(params.organizerPublicKey, 'add_checkin_signer', [
+      new Address(params.organizerPublicKey).toScVal(),
+      nativeToScVal(params.chainEventId, { type: 'u64' }),
+      new Address(params.signerPublicKey).toScVal(),
+    ]);
+  }
+
+  /** #515 — withdraws a device's check-in signing right. */
+  buildRemoveCheckinSignerTx(params: {
+    organizerPublicKey: string;
+    chainEventId: bigint;
+    signerPublicKey: string;
+  }): Promise<string> {
+    return this.buildTx(params.organizerPublicKey, 'remove_checkin_signer', [
+      new Address(params.organizerPublicKey).toScVal(),
+      nativeToScVal(params.chainEventId, { type: 'u64' }),
+      new Address(params.signerPublicKey).toScVal(),
+    ]);
+  }
+
+  /** #515 — whether `signerPublicKey` may sign `check_in` for the event. */
+  async isCheckinSigner(
+    chainEventId: bigint,
+    signerPublicKey: string,
+  ): Promise<boolean> {
+    const result = await this.simulateRead('is_checkin_signer', [
+      nativeToScVal(chainEventId, { type: 'u64' }),
+      new Address(signerPublicKey).toScVal(),
+    ]);
+    return scValToNative(result) === true;
+  }
+
   buildRevokeTicketTx(params: {
     organizerPublicKey: string;
     chainTicketId: bigint;

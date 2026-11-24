@@ -866,11 +866,12 @@ scanner confirm check-ins without a staff JWT.
 | field | type | rules |
 |---|---|---|
 | `name` | string | required, 1 to 256 characters after trimming |
+| `stellarPublicKey` | string | optional, the device's own Stellar public key (`G...`); the device keeps the secret (#515) |
 
 ```bash
 curl -s -X POST "$API/v1/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/scanner-devices" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name":"Front Door Scanner"}'
+  -d '{"name":"Front Door Scanner","stellarPublicKey":"GDEVICE..."}'
 ```
 
 ```json
@@ -880,6 +881,8 @@ curl -s -X POST "$API/v1/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/scanner-dev
     "eventId": "7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c",
     "name": "Front Door Scanner",
     "tokenHash": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "stellarPublicKey": "GDEVICE...",
+    "signerRegisteredAt": null,
     "lastUsedAt": null,
     "revokedAt": null,
     "createdAt": "2026-09-27T12:30:00.000Z"
@@ -898,10 +901,32 @@ Array of device rows (without tokens), newest first.
 curl -s "$API/v1/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/scanner-devices" -H "Authorization: Bearer $TOKEN"
 ```
 
+### `POST /v1/events/:eventId/scanner-devices/:deviceId/signer`
+
+#515. Builds `add_checkin_signer(organizer, chainEventId, device key)` for
+the organizer's wallet to sign, so the device can sign `check_in` itself and
+the gate never holds the organizer key. `400` when the device has no
+`stellarPublicKey`, is revoked, or the event is not on chain yet. Returns
+`{ "unsignedXdr": "..." }`.
+
+### `POST /v1/events/:eventId/scanner-devices/:deviceId/confirm-signer`
+
+Body `{ "signedXdr": "..." }`. Checks that the envelope is that call for this
+device and event, submits it, then reads `is_checkin_signer` and sets
+`signerRegisteredAt` only if the chain confirms it (`409` otherwise). Returns
+the device row.
+
+### `POST /v1/events/:eventId/scanner-devices/:deviceId/remove-signer` and `.../confirm-remove-signer`
+
+The same pair for `remove_checkin_signer`, which clears
+`signerRegisteredAt`. It works on revoked devices too: revoke a lost device,
+then remove its signer, so its key can no longer check tickets in on chain.
+
 ### `PATCH /v1/events/:eventId/scanner-devices/:deviceId/revoke`
 
 Sets `revokedAt`; the token stops authenticating immediately. Returns
-the row.
+the row. Revoking does not touch the chain: if the device has a registered
+signer (`signerRegisteredAt` set), also call `remove-signer`.
 
 ```bash
 curl -s -X PATCH "$API/v1/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/scanner-devices/0b2d4f6a-8c1e-4a3b-9d5f-6e7a8b9c0d2e/revoke" \
@@ -1299,12 +1324,22 @@ curl -s -X POST "$API/v1/tickets/6f0a2c4e-8b1d-4f3a-9e5c-7d8e9f0a1b2c/confirm-ch
 Returns the ticket row with `status: "USED"`, `checkedInAt`,
 `checkedInGateId` and `checkInReason`.
 
+#### `POST /v1/tickets/:ticketId/scanner-check-in/build`
+
+#515. Authenticated with a scanner device token. Returns an unsigned
+`check_in` with the device's own key as the signer (the contract accepts any
+registered check-in signer in that position), for the device to sign. `400`
+unless the device's key is registered (`signerRegisteredAt` set).
+
 #### `POST /v1/tickets/:ticketId/scanner-check-in`
 
 Same body as `confirm-check-in`, authenticated with a scanner device
 token instead of a JWT: either `Authorization: Bearer <token>` or
 `x-device-token: <token>`. `401` when the token is unknown, revoked, or
-registered for a different event than the ticket's.
+registered for a different event than the ticket's. A device with a
+registered signer key must sign with it; a device without one still sends an
+organizer-signed envelope, so existing devices keep working until they get a
+key.
 
 ```bash
 curl -s -X POST "$API/v1/tickets/6f0a2c4e-8b1d-4f3a-9e5c-7d8e9f0a1b2c/scanner-check-in" \

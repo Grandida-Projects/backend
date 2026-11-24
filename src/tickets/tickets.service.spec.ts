@@ -2288,6 +2288,100 @@ describe('TicketsService', () => {
     });
   });
 
+  // ---- #515 scanner devices sign with their own key ----
+
+  describe('device check-in signer (#515)', () => {
+    const DEVICE_KEY = 'G' + 'D'.repeat(55);
+    const registered = {
+      stellarPublicKey: DEVICE_KEY,
+      signerRegisteredAt: new Date('2026-11-24T00:00:00Z'),
+    };
+    beforeEach(() => {
+      prisma.ticket.findUnique.mockResolvedValue({
+        id: 'ticket-1',
+        eventId: 'event-1',
+        chainTicketId: 7n,
+        event: {
+          organizationId: 'org-1',
+          organization: { stellarAccount: 'GORG' },
+        },
+      });
+      prisma.ticket.update.mockResolvedValue({
+        id: 'ticket-1',
+        status: 'USED',
+      });
+    });
+
+    it('builds check_in with the device key as the signer', async () => {
+      const result = await service.buildCheckInTxByDevice(
+        'ticket-1',
+        registered,
+      );
+
+      expect(result).toEqual({ unsignedXdr: 'unsigned-xdr' });
+      expect(stellar.buildCheckInTx).toHaveBeenCalledWith({
+        organizerPublicKey: DEVICE_KEY,
+        chainTicketId: 7n,
+      });
+    });
+
+    it('will not build for a device whose key is not registered on chain', async () => {
+      await expect(
+        service.buildCheckInTxByDevice('ticket-1', {
+          stellarPublicKey: DEVICE_KEY,
+          signerRegisteredAt: null,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('accepts a check-in signed by the registered device key', async () => {
+      mockSignedCall('check_in', [DEVICE_KEY, 7n]);
+
+      await service.confirmCheckInByDevice(
+        'ticket-1',
+        'signed-xdr',
+        undefined,
+        undefined,
+        registered,
+      );
+
+      expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
+        'signed-xdr',
+      );
+    });
+
+    it('rejects an organizer-signed check-in from a device that has its own key', async () => {
+      mockSignedCall('check_in', ['GORG', 7n]);
+
+      await expect(
+        service.confirmCheckInByDevice(
+          'ticket-1',
+          'signed-xdr',
+          undefined,
+          undefined,
+          registered,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+    });
+
+    it('keeps the organizer-signed path for a device without a registered key', async () => {
+      mockSignedCall('check_in', ['GORG', 7n]);
+
+      await service.confirmCheckInByDevice(
+        'ticket-1',
+        'signed-xdr',
+        undefined,
+        undefined,
+        { stellarPublicKey: null, signerRegisteredAt: null },
+      );
+
+      expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
+        'signed-xdr',
+      );
+    });
+  });
+
   // ---- confirmCheckIn / confirmRevoke status updates (#413) ----
 
   describe('confirmCheckIn — status update', () => {

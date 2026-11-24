@@ -52,6 +52,12 @@ function toStoredResponse(value: unknown): Prisma.InputJsonValue {
   ) as Prisma.InputJsonValue;
 }
 
+/** #515 — the parts of a `ScannerDevice` that decide how it signs check-ins. */
+export interface DeviceSigner {
+  stellarPublicKey: string | null;
+  signerRegisteredAt: Date | null;
+}
+
 /** #503 — the cached `Ticket.status` for each on-chain ticket status. */
 const TICKET_STATUS_FOR_CHAIN: Record<OnChainTicket['status'], TicketStatus> = {
   Valid: TicketStatus.VALID,
@@ -596,22 +602,45 @@ export class TicketsService {
   }
 
   /**
+   * #515 — an unsigned `check_in` for a scanner device to sign with its own
+   * key. The device must have that key registered as a check-in signer for
+   * the event (`add_checkin_signer`); the contract accepts any registered
+   * signer as the first argument.
+   */
+  async buildCheckInTxByDevice(ticketId: string, device: DeviceSigner) {
+    const ticket = await this.getTicketWithOrg(ticketId);
+    const unsignedXdr = await this.stellar.buildCheckInTx({
+      organizerPublicKey: this.deviceSignerKey(device),
+      chainTicketId: ticket.chainTicketId,
+    });
+    return { unsignedXdr };
+  }
+
+  /**
    * Check-in via a `ScannerDevice` token (see `ScannerDeviceGuard`) instead
    * of a staff JWT. The guard already confirmed the device is live and
    * scoped to this ticket's event, so no `organizations.assertMember` call
    * is needed here.
+   *
+   * #515 — a device with a registered signer key must sign with that key.
+   * A device without one keeps the organizer-signed path, so existing
+   * devices continue to work until they are given a key.
    */
   async confirmCheckInByDevice(
     ticketId: string,
     signedXdr: string,
     gateId?: string,
     reason?: string,
+    device?: DeviceSigner,
   ) {
     const ticket = await this.getTicketWithOrg(ticketId);
     const replay = await this.findProcessedTx<Ticket>(signedXdr);
     if (replay) return replay.value;
+    const signer = device?.signerRegisteredAt
+      ? this.deviceSignerKey(device)
+      : ticket.event.organization.stellarAccount;
     this.assertSignedInvocation(signedXdr, 'check_in', [
-      ['organizer', 0, ticket.event.organization.stellarAccount],
+      ['signer', 0, signer],
       ['ticket', 1, ticket.chainTicketId],
     ]);
     if (gateId) {
@@ -631,6 +660,15 @@ export class TicketsService {
       await this.recordProcessedTx(tx, signedXdr, 'check-in', checkedIn);
       return checkedIn;
     });
+  }
+
+  private deviceSignerKey(device: DeviceSigner): string {
+    if (!device.stellarPublicKey || !device.signerRegisteredAt) {
+      throw new BadRequestException(
+        'This scanner device has no registered check-in signer key',
+      );
+    }
+    return device.stellarPublicKey;
   }
 
   // ---- Revocation (fraud prevention) ----
