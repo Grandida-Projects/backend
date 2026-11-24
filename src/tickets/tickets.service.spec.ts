@@ -1551,29 +1551,98 @@ describe('TicketsService', () => {
       });
     });
 
-    it('updates resale listing price and logs price audit history', async () => {
-      prisma.resaleListing.findUnique.mockResolvedValue({
+    describe('updateResalePrice re-lists on chain (#502)', () => {
+      const listing = {
         id: 'listing-1',
         sellerId: 'owner-1',
         status: 'ACTIVE',
         price: 1000n,
         ticket: {
+          chainTicketId: 7n,
           ticketType: { price: 1_000n },
           event: { maxResaleMultiplierBps: 20_000 },
         },
+      };
+      beforeEach(() => {
+        prisma.resaleListing.findUnique.mockResolvedValue(listing);
+        prisma.user.findUnique.mockResolvedValue({
+          id: 'owner-1',
+          stellarPublicKey: 'GOWNER',
+        });
       });
 
-      await service.updateResalePrice('owner-1', 'listing-1', '1500');
+      it('builds a list_for_resale at the new price for the seller to sign', async () => {
+        const result = await service.buildUpdateResalePriceTx(
+          'owner-1',
+          'listing-1',
+          '1500',
+        );
 
-      expect(prisma.resalePriceHistory.create).toHaveBeenCalledWith({
-        data: {
-          resaleListingId: 'listing-1',
+        expect(result).toEqual({ unsignedXdr: 'unsigned-xdr' });
+        expect(stellar.buildListForResaleTx).toHaveBeenCalledWith({
+          ownerPublicKey: 'GOWNER',
+          chainTicketId: 7n,
           price: 1500n,
-        },
+        });
       });
-      expect(prisma.resaleListing.update).toHaveBeenCalledWith({
-        where: { id: 'listing-1' },
-        data: { price: 1500n },
+
+      it('submits the re-listing and stores the price the chain recorded', async () => {
+        mockSignedCall('list_for_resale', ['GOWNER', 7n, 1500n]);
+        stellar.verifyTicket.mockResolvedValue({ resalePrice: 1500n });
+
+        await service.updateResalePrice(
+          'owner-1',
+          'listing-1',
+          '1500',
+          'signed-xdr',
+        );
+
+        expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
+          'signed-xdr',
+          expect.anything(),
+        );
+        expect(stellar.verifyTicket).toHaveBeenCalledWith(7n);
+        expect(prisma.resalePriceHistory.create).toHaveBeenCalledWith({
+          data: { resaleListingId: 'listing-1', price: 1500n },
+        });
+        expect(prisma.resaleListing.update).toHaveBeenCalledWith({
+          where: { id: 'listing-1' },
+          data: { price: 1500n },
+        });
+        expect(prisma.processedTx.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ operation: 'update-resale-price' }),
+          }),
+        );
+      });
+
+      it('rejects an envelope whose price differs from the body, before submitting', async () => {
+        mockSignedCall('list_for_resale', ['GOWNER', 7n, 1400n]);
+
+        await expect(
+          service.updateResalePrice(
+            'owner-1',
+            'listing-1',
+            '1500',
+            'signed-xdr',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+        expect(prisma.resaleListing.update).not.toHaveBeenCalled();
+      });
+
+      it('rejects an envelope signed by someone other than the seller', async () => {
+        mockSignedCall('list_for_resale', ['GSTRANGER', 7n, 1500n]);
+
+        await expect(
+          service.updateResalePrice(
+            'owner-1',
+            'listing-1',
+            '1500',
+            'signed-xdr',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
       });
     });
 
@@ -1592,22 +1661,129 @@ describe('TicketsService', () => {
       });
     });
 
-    it('cancels expired listings and restores ticket status to VALID', async () => {
-      prisma.resaleListing.findMany.mockResolvedValue([
-        { id: 'listing-exp-1', ticketId: 'ticket-exp-1' },
-        { id: 'listing-exp-2', ticketId: 'ticket-exp-2' },
-      ]);
-
-      const res = await service.cancelExpiredListings();
-
-      expect(res.cancelledCount).toBe(2);
-      expect(prisma.resaleListing.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['listing-exp-1', 'listing-exp-2'] } },
-        data: { status: 'CANCELLED' },
+    describe('cancelExpiredListings follows the chain (#503)', () => {
+      const expired = (n: number, extra: Record<string, unknown> = {}) => ({
+        id: `listing-exp-${n}`,
+        ticketId: `ticket-exp-${n}`,
+        expiryNotifiedAt: null,
+        ticket: { id: `ticket-exp-${n}`, chainTicketId: BigInt(n) },
+        seller: { email: `seller${n}@example.com`, name: `Seller ${n}` },
+        ...extra,
       });
-      expect(prisma.ticket.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['ticket-exp-1', 'ticket-exp-2'] } },
-        data: { status: 'VALID' },
+      const notifications = { sendResaleListingExpired: jest.fn() };
+      beforeEach(() => {
+        notifications.sendResaleListingExpired
+          .mockReset()
+          .mockResolvedValue(undefined);
+        // The shared service is built without NotificationService.
+        (
+          service as unknown as { notifications: typeof notifications }
+        ).notifications = notifications;
+        prisma.ticket.findUnique.mockResolvedValue({
+          event: { name: 'Launch Night' },
+        });
+      });
+
+      it('keeps a listing that is still live on chain RESALE and asks the seller to cancel it', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([expired(1)]);
+        stellar.verifyTicket.mockResolvedValue({ status: 'Resale' });
+
+        const res = await service.cancelExpiredListings();
+
+        expect(res).toEqual({
+          cancelledCount: 0,
+          awaitingSellerCount: 1,
+          failedCount: 0,
+        });
+        expect(prisma.ticket.update).not.toHaveBeenCalled();
+        expect(prisma.resaleListing.updateMany).not.toHaveBeenCalled();
+        expect(notifications.sendResaleListingExpired).toHaveBeenCalledWith({
+          to: 'seller1@example.com',
+          sellerName: 'Seller 1',
+          eventName: 'Launch Night',
+          ticketId: 'ticket-exp-1',
+        });
+        expect(prisma.resaleListing.update).toHaveBeenCalledWith({
+          where: { id: 'listing-exp-1' },
+          data: { expiryNotifiedAt: expect.any(Date) },
+        });
+      });
+
+      it('asks the seller only once', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([
+          expired(1, { expiryNotifiedAt: new Date('2026-11-01T00:00:00Z') }),
+        ]);
+        stellar.verifyTicket.mockResolvedValue({ status: 'Resale' });
+
+        await service.cancelExpiredListings();
+
+        expect(notifications.sendResaleListingExpired).not.toHaveBeenCalled();
+        expect(prisma.resaleListing.update).not.toHaveBeenCalled();
+      });
+
+      it('cancels the listing and takes the chain status once it is delisted on chain', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([
+          expired(1),
+          expired(2),
+        ]);
+        stellar.verifyTicket
+          .mockResolvedValueOnce({ status: 'Valid' })
+          .mockResolvedValueOnce({ status: 'Used' });
+
+        const res = await service.cancelExpiredListings();
+
+        expect(res).toEqual({
+          cancelledCount: 2,
+          awaitingSellerCount: 0,
+          failedCount: 0,
+        });
+        expect(prisma.resaleListing.updateMany).toHaveBeenCalledWith({
+          where: { id: 'listing-exp-1', status: 'ACTIVE' },
+          data: { status: 'CANCELLED' },
+        });
+        expect(prisma.ticket.update).toHaveBeenCalledWith({
+          where: { id: 'ticket-exp-1' },
+          data: { status: 'VALID' },
+        });
+        expect(prisma.ticket.update).toHaveBeenCalledWith({
+          where: { id: 'ticket-exp-2' },
+          data: { status: 'USED' },
+        });
+      });
+
+      it('leaves a listing untouched when the chain cannot be read', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([
+          expired(1),
+          expired(2),
+        ]);
+        stellar.verifyTicket
+          .mockRejectedValueOnce(new Error('RPC unavailable'))
+          .mockResolvedValueOnce({ status: 'Valid' });
+
+        const res = await service.cancelExpiredListings();
+
+        expect(res).toEqual({
+          cancelledCount: 1,
+          awaitingSellerCount: 0,
+          failedCount: 1,
+        });
+        expect(prisma.ticket.update).toHaveBeenCalledTimes(1);
+        expect(prisma.ticket.update).toHaveBeenCalledWith({
+          where: { id: 'ticket-exp-2' },
+          data: { status: 'VALID' },
+        });
+      });
+
+      it('never marks a ticket VALID while the chain still has it listed', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([expired(1)]);
+        stellar.verifyTicket.mockResolvedValue({ status: 'Resale' });
+
+        await service.cancelExpiredListings();
+
+        expect(prisma.ticket.update).not.toHaveBeenCalledWith(
+          expect.objectContaining({ data: { status: 'VALID' } }),
+        );
+        expect(prisma.ticket.updateMany).not.toHaveBeenCalled();
       });
     });
   });
@@ -2313,15 +2489,33 @@ describe('TicketsService', () => {
       prisma.resaleListing.findUnique.mockResolvedValue(listingWithPricingInfo);
 
       await expect(
-        service.updateResalePrice('owner-1', 'listing-1', '1101'),
+        service.buildUpdateResalePriceTx('owner-1', 'listing-1', '1101'),
       ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.updateResalePrice('owner-1', 'listing-1', '1101', 'signed-xdr'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
       expect(prisma.resaleListing.update).not.toHaveBeenCalled();
     });
 
     it('accepts a new price at the cap', async () => {
-      prisma.resaleListing.findUnique.mockResolvedValue(listingWithPricingInfo);
+      prisma.resaleListing.findUnique.mockResolvedValue({
+        ...listingWithPricingInfo,
+        ticket: { ...listingWithPricingInfo.ticket, chainTicketId: 7n },
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'owner-1',
+        stellarPublicKey: 'GOWNER',
+      });
+      mockSignedCall('list_for_resale', ['GOWNER', 7n, 1100n]);
+      stellar.verifyTicket.mockResolvedValue({ resalePrice: 1100n });
 
-      await service.updateResalePrice('owner-1', 'listing-1', '1100');
+      await service.updateResalePrice(
+        'owner-1',
+        'listing-1',
+        '1100',
+        'signed-xdr',
+      );
 
       expect(prisma.resaleListing.update).toHaveBeenCalledWith({
         where: { id: 'listing-1' },
@@ -2336,7 +2530,7 @@ describe('TicketsService', () => {
       });
 
       await expect(
-        service.updateResalePrice('owner-1', 'listing-1', '900'),
+        service.updateResalePrice('owner-1', 'listing-1', '900', 'signed-xdr'),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
@@ -2344,7 +2538,12 @@ describe('TicketsService', () => {
       prisma.resaleListing.findUnique.mockResolvedValue(listingWithPricingInfo);
 
       await expect(
-        service.updateResalePrice('someone-else', 'listing-1', '900'),
+        service.updateResalePrice(
+          'someone-else',
+          'listing-1',
+          '900',
+          'signed-xdr',
+        ),
       ).rejects.toBeInstanceOf(ForbiddenException);
     });
   });
@@ -2363,6 +2562,10 @@ describe('TicketsService', () => {
         chainEventId: 42n,
         organization: { stellarAccount: 'GORGANIZER' },
       });
+      prisma.ticket.findMany.mockResolvedValue([
+        { id: 'ticket-1', eventId: 'event-1', status: 'VALID' },
+        { id: 'ticket-2', eventId: 'event-1', status: 'RESALE' },
+      ]);
       prisma.ticket.findMany.mockResolvedValue(
         ids.map((id, i) => ({
           id,
@@ -2409,6 +2612,105 @@ describe('TicketsService', () => {
         ['signed-1'],
       );
 
+      expect(result).toEqual({
+        count: 2,
+        revokedIds: ['ticket-1', 'ticket-2'],
+        skipped: [],
+      });
+      expect(prisma.ticket.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: {
+            id: { in: ['ticket-1', 'ticket-2'] },
+            status: { in: ['VALID', 'RESALE'] },
+          },
+          data: { status: 'REVOKED' },
+        }),
+      );
+    });
+
+    describe('already revoked or used tickets (#501)', () => {
+      const audit = { record: jest.fn() };
+      beforeEach(() => {
+        audit.record.mockReset().mockResolvedValue(undefined);
+        // The shared service is built without AuditService.
+        (service as unknown as { audit: typeof audit }).audit = audit;
+      });
+
+      const event = {
+        id: 'event-1',
+        organizationId: 'org-1',
+        organization: { stellarAccount: 'GORGANIZER' },
+      };
+
+      it('skips them, reports them, and audits only real revocations', async () => {
+        prisma.event.findUnique.mockResolvedValue(event);
+        prisma.ticket.findMany.mockResolvedValue([
+          { id: 'ticket-1', eventId: 'event-1', status: 'VALID' },
+          { id: 'ticket-2', eventId: 'event-1', status: 'REVOKED' },
+          { id: 'ticket-3', eventId: 'event-1', status: 'USED' },
+        ]);
+        prisma.ticket.updateMany.mockResolvedValue({ count: 1 });
+
+        const result = await service.revokeBatch('user-1', 'event-1', [
+          'ticket-1',
+          'ticket-2',
+          'ticket-3',
+        ]);
+
+        expect(result).toEqual({
+          count: 1,
+          revokedIds: ['ticket-1'],
+          skipped: [
+            { ticketId: 'ticket-2', status: 'REVOKED' },
+            { ticketId: 'ticket-3', status: 'USED' },
+          ],
+        });
+        expect(prisma.ticket.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              id: { in: ['ticket-1'] },
+              status: { in: ['VALID', 'RESALE'] },
+            },
+          }),
+        );
+        expect(audit.record).toHaveBeenCalledWith(
+          'user-1',
+          'ticket.revoke_batch',
+          'Event',
+          'event-1',
+          {
+            ticketIds: ['ticket-1'],
+            count: 1,
+            skipped: [
+              { ticketId: 'ticket-2', status: 'REVOKED' },
+              { ticketId: 'ticket-3', status: 'USED' },
+            ],
+          },
+        );
+      });
+
+      it('writes and audits nothing when every ticket is already terminal', async () => {
+        prisma.event.findUnique.mockResolvedValue(event);
+        prisma.ticket.findMany.mockResolvedValue([
+          { id: 'ticket-2', eventId: 'event-1', status: 'REVOKED' },
+        ]);
+
+        const result = await service.revokeBatch('user-1', 'event-1', [
+          'ticket-2',
+        ]);
+
+        expect(result).toEqual({
+          count: 0,
+          revokedIds: [],
+          skipped: [{ ticketId: 'ticket-2', status: 'REVOKED' }],
+        });
+        expect(prisma.ticket.updateMany).not.toHaveBeenCalled();
+        expect(audit.record).not.toHaveBeenCalled();
+      });
+    });
+
+    it('rejects batch exceeding max size', async () => {
+      const ticketIds = Array.from({ length: 101 }, (_, i) => `ticket-${i}`);
       expect(result.count).toBe(2);
       expect(stellar.submitSignedTransaction).toHaveBeenCalledTimes(1);
       expect(prisma.ticket.updateMany).toHaveBeenCalledWith({
@@ -2477,6 +2779,100 @@ describe('TicketsService', () => {
       await expect(
         service.buildRevokeBatch('user-1', 'event-1', ticketIds(2)),
       ).rejects.toBeInstanceOf(BadRequestException);
+    });
+  });
+
+  // ---- #515 scanner devices sign with their own key ----
+
+  describe('device check-in signer (#515)', () => {
+    const DEVICE_KEY = 'G' + 'D'.repeat(55);
+    const registered = {
+      stellarPublicKey: DEVICE_KEY,
+      signerRegisteredAt: new Date('2026-11-24T00:00:00Z'),
+    };
+    beforeEach(() => {
+      prisma.ticket.findUnique.mockResolvedValue({
+        id: 'ticket-1',
+        eventId: 'event-1',
+        chainTicketId: 7n,
+        event: {
+          organizationId: 'org-1',
+          organization: { stellarAccount: 'GORG' },
+        },
+      });
+      prisma.ticket.update.mockResolvedValue({
+        id: 'ticket-1',
+        status: 'USED',
+      });
+    });
+
+    it('builds check_in with the device key as the signer', async () => {
+      const result = await service.buildCheckInTxByDevice(
+        'ticket-1',
+        registered,
+      );
+
+      expect(result).toEqual({ unsignedXdr: 'unsigned-xdr' });
+      expect(stellar.buildCheckInTx).toHaveBeenCalledWith({
+        organizerPublicKey: DEVICE_KEY,
+        chainTicketId: 7n,
+      });
+    });
+
+    it('will not build for a device whose key is not registered on chain', async () => {
+      await expect(
+        service.buildCheckInTxByDevice('ticket-1', {
+          stellarPublicKey: DEVICE_KEY,
+          signerRegisteredAt: null,
+        }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+    });
+
+    it('accepts a check-in signed by the registered device key', async () => {
+      mockSignedCall('check_in', [DEVICE_KEY, 7n]);
+
+      await service.confirmCheckInByDevice(
+        'ticket-1',
+        'signed-xdr',
+        undefined,
+        undefined,
+        registered,
+      );
+
+      expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
+        'signed-xdr',
+      );
+    });
+
+    it('rejects an organizer-signed check-in from a device that has its own key', async () => {
+      mockSignedCall('check_in', ['GORG', 7n]);
+
+      await expect(
+        service.confirmCheckInByDevice(
+          'ticket-1',
+          'signed-xdr',
+          undefined,
+          undefined,
+          registered,
+        ),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+    });
+
+    it('keeps the organizer-signed path for a device without a registered key', async () => {
+      mockSignedCall('check_in', ['GORG', 7n]);
+
+      await service.confirmCheckInByDevice(
+        'ticket-1',
+        'signed-xdr',
+        undefined,
+        undefined,
+        { stellarPublicKey: null, signerRegisteredAt: null },
+      );
+
+      expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
+        'signed-xdr',
+      );
     });
   });
 

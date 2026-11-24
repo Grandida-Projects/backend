@@ -251,8 +251,11 @@ also run on a schedule, flips listings past their `expiresAt` back to
 
 Two callers can check a ticket in: a staff member with a JWT, and a
 registered scanner device with its own bearer token. Both end in the
-same `check_in` contract call, signed by the organizer's organization
-account, and the same Postgres update. Before scanning, the gate app
+same `check_in` contract call and the same Postgres update. Staff
+check-ins are signed by the organizer's organization account. A device
+with its own Stellar key, registered with `add_checkin_signer`, signs
+`check_in` itself (`POST /tickets/:ticketId/scanner-check-in/build`), so
+gates never hold the organizer key (#515). Before scanning, the gate app
 usually verifies the QR code, which is a read-only simulation.
 
 ```mermaid

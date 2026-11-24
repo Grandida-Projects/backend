@@ -54,6 +54,26 @@ function toStoredResponse(value: unknown): Prisma.InputJsonValue {
   ) as Prisma.InputJsonValue;
 }
 
+/** #515 — the parts of a `ScannerDevice` that decide how it signs check-ins. */
+export interface DeviceSigner {
+  stellarPublicKey: string | null;
+  signerRegisteredAt: Date | null;
+}
+
+/** #503 — the cached `Ticket.status` for each on-chain ticket status. */
+const TICKET_STATUS_FOR_CHAIN: Record<OnChainTicket['status'], TicketStatus> = {
+  Valid: TicketStatus.VALID,
+  Used: TicketStatus.USED,
+  Revoked: TicketStatus.REVOKED,
+  Resale: TicketStatus.RESALE,
+};
+
+/** #501 — statuses `revokeBatch` may move to REVOKED. */
+const REVOCABLE_STATUSES: TicketStatus[] = [
+  TicketStatus.VALID,
+  TicketStatus.RESALE,
+];
+
 @Injectable()
 export class TicketsService {
   private readonly logger = new Logger(TicketsService.name);
@@ -615,22 +635,45 @@ export class TicketsService {
   }
 
   /**
+   * #515 — an unsigned `check_in` for a scanner device to sign with its own
+   * key. The device must have that key registered as a check-in signer for
+   * the event (`add_checkin_signer`); the contract accepts any registered
+   * signer as the first argument.
+   */
+  async buildCheckInTxByDevice(ticketId: string, device: DeviceSigner) {
+    const ticket = await this.getTicketWithOrg(ticketId);
+    const unsignedXdr = await this.stellar.buildCheckInTx({
+      organizerPublicKey: this.deviceSignerKey(device),
+      chainTicketId: ticket.chainTicketId,
+    });
+    return { unsignedXdr };
+  }
+
+  /**
    * Check-in via a `ScannerDevice` token (see `ScannerDeviceGuard`) instead
    * of a staff JWT. The guard already confirmed the device is live and
    * scoped to this ticket's event, so no `organizations.assertMember` call
    * is needed here.
+   *
+   * #515 — a device with a registered signer key must sign with that key.
+   * A device without one keeps the organizer-signed path, so existing
+   * devices continue to work until they are given a key.
    */
   async confirmCheckInByDevice(
     ticketId: string,
     signedXdr: string,
     gateId?: string,
     reason?: string,
+    device?: DeviceSigner,
   ) {
     const ticket = await this.getTicketWithOrg(ticketId);
     const replay = await this.findProcessedTx<Ticket>(signedXdr);
     if (replay) return replay.value;
+    const signer = device?.signerRegisteredAt
+      ? this.deviceSignerKey(device)
+      : ticket.event.organization.stellarAccount;
     this.assertSignedInvocation(signedXdr, 'check_in', [
-      ['organizer', 0, ticket.event.organization.stellarAccount],
+      ['signer', 0, signer],
       ['ticket', 1, ticket.chainTicketId],
     ]);
     if (gateId) {
@@ -650,6 +693,15 @@ export class TicketsService {
       await this.recordProcessedTx(tx, signedXdr, 'check-in', checkedIn);
       return checkedIn;
     });
+  }
+
+  private deviceSignerKey(device: DeviceSigner): string {
+    if (!device.stellarPublicKey || !device.signerRegisteredAt) {
+      throw new BadRequestException(
+        'This scanner device has no registered check-in signer key',
+      );
+    }
+    return device.stellarPublicKey;
   }
 
   // ---- Revocation (fraud prevention) ----
@@ -756,6 +808,12 @@ export class TicketsService {
       );
     }
 
+    const tickets = await this.prisma.ticket.findMany({
+      where: {
+        id: { in: ticketIds },
+        eventId,
+      },
+      select: { id: true, status: true },
     // Validate the entire batch before any network call: a mismatched chunk
     // must never revoke tickets the organizer did not ask to revoke.
     signedXdrs.forEach((signedXdr, index) => {
@@ -780,6 +838,26 @@ export class TicketsService {
       await this.stellar.submitSignedTransaction(signedXdr);
     }
 
+    // #501 — only VALID and RESALE tickets can be revoked. Already revoked or
+    // used tickets are skipped and reported, so the audit log only records
+    // revocations that changed something.
+    const revocable = tickets.filter((t) =>
+      REVOCABLE_STATUSES.includes(t.status),
+    );
+    const revokedIds = revocable.map((t) => t.id);
+    const skipped = tickets
+      .filter((t) => !REVOCABLE_STATUSES.includes(t.status))
+      .map((t) => ({ ticketId: t.id, status: t.status }));
+
+    if (revokedIds.length === 0) {
+      return { count: 0, revokedIds, skipped };
+    }
+
+    const result = await this.prisma.ticket.updateMany({
+      // The status condition is repeated so a ticket that changed after the
+      // read above is not revoked twice or resurrected from USED.
+      where: { id: { in: revokedIds }, status: { in: REVOCABLE_STATUSES } },
+      data: { status: TicketStatus.REVOKED },
     const result = await this.prisma.$transaction(async (tx) => {
       const updated = await tx.ticket.updateMany({
         where: { id: { in: ticketIds }, eventId },
@@ -796,10 +874,11 @@ export class TicketsService {
 
     // #209 — audit batch revocation (one entry per batch).
     await this.audit?.record(userId, 'ticket.revoke_batch', 'Event', eventId, {
-      ticketIds,
+      ticketIds: revokedIds,
       count: result.count,
+      skipped,
     });
-    return result;
+    return { count: result.count, revokedIds, skipped };
   }
 
   /** Splits chain ticket ids into contract-sized `revoke_batch` chunks. */
@@ -1014,7 +1093,86 @@ export class TicketsService {
     }
   }
 
-  async updateResalePrice(userId: string, listingId: string, newPrice: string) {
+  /**
+   * #502 — step 1 of a price change: an unsigned `list_for_resale` at the new
+   * price. The contract allows re-listing a ticket it already has listed, so
+   * this replaces the on-chain `resale_price` once the seller signs it.
+   */
+  async buildUpdateResalePriceTx(
+    userId: string,
+    listingId: string,
+    newPrice: string,
+  ) {
+    const listing = await this.loadUpdatableListing(
+      userId,
+      listingId,
+      newPrice,
+    );
+    const owner = await this.getUserWithWallet(userId);
+    const unsignedXdr = await this.stellar.buildListForResaleTx({
+      ownerPublicKey: owner.stellarPublicKey!,
+      chainTicketId: listing.ticket.chainTicketId,
+      price: BigInt(newPrice),
+    });
+    return { unsignedXdr };
+  }
+
+  /**
+   * #502 — step 2: relays the signed re-listing, then stores the price the
+   * chain recorded. Changing only the DB price would show buyers one price
+   * while `buy_resale` charges another.
+   */
+  async updateResalePrice(
+    userId: string,
+    listingId: string,
+    newPrice: string,
+    signedXdr: string,
+  ) {
+    const replay = await this.findProcessedTx<ResaleListing>(signedXdr);
+    if (replay) return replay.value;
+    const listing = await this.loadUpdatableListing(
+      userId,
+      listingId,
+      newPrice,
+    );
+    const owner = await this.getUserWithWallet(userId);
+    this.assertSignedInvocation(signedXdr, 'list_for_resale', [
+      ['owner', 0, owner.stellarPublicKey],
+      ['ticket', 1, listing.ticket.chainTicketId],
+      ['price', 2, BigInt(newPrice)],
+    ]);
+    await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
+    const { resalePrice } = await this.stellar.verifyTicket(
+      listing.ticket.chainTicketId,
+    );
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.resalePriceHistory.create({
+        data: { resaleListingId: listingId, price: resalePrice },
+      });
+      const updated = await tx.resaleListing.update({
+        where: { id: listingId },
+        data: { price: resalePrice },
+      });
+      await this.recordProcessedTx(
+        tx,
+        signedXdr,
+        'update-resale-price',
+        updated,
+      );
+      return updated;
+    });
+  }
+
+  /** Shared checks for both price-change steps (#318, #319, #502). */
+  private async loadUpdatableListing(
+    userId: string,
+    listingId: string,
+    newPrice: string,
+  ) {
     const listing = await this.prisma.resaleListing.findUnique({
       where: { id: listingId },
       include: {
@@ -1037,19 +1195,7 @@ export class TicketsService {
       listing.ticket.ticketType.price,
       listing.ticket.event.maxResaleMultiplierBps,
     );
-
-    return this.prisma.$transaction(async (tx) => {
-      await tx.resalePriceHistory.create({
-        data: {
-          resaleListingId: listingId,
-          price: BigInt(newPrice),
-        },
-      });
-      return tx.resaleListing.update({
-        where: { id: listingId },
-        data: { price: BigInt(newPrice) },
-      });
-    });
+    return listing;
   }
 
   async getPriceHistory(listingId: string) {
@@ -1065,6 +1211,20 @@ export class TicketsService {
     });
   }
 
+  /**
+   * #503 — expiry is a database-only concept: `list_for_resale` carries no
+   * expiry, so the contract keeps an expired listing live and only the
+   * seller can delist it with `cancel_resale`. Each expired listing is
+   * therefore checked against the chain:
+   *   - still `Resale` on chain: the database keeps it RESALE / ACTIVE (it
+   *     can still be bought), and the seller is asked once to sign
+   *     `cancel_resale`;
+   *   - no longer listed on chain: the listing is CANCELLED and the ticket
+   *     takes its on-chain status;
+   *   - the chain could not be read: nothing changes, and the next run
+   *     retries.
+   * So the database never reports VALID for a ticket the chain has listed.
+   */
   async cancelExpiredListings() {
     const now = new Date();
     const expiredListings = await this.prisma.resaleListing.findMany({
@@ -1072,27 +1232,78 @@ export class TicketsService {
         status: ResaleListingStatus.ACTIVE,
         expiresAt: { lte: now },
       },
+      include: {
+        ticket: { select: { id: true, chainTicketId: true } },
+        seller: { select: { email: true, name: true } },
+      },
     });
 
-    if (expiredListings.length === 0) {
-      return { cancelledCount: 0 };
+    let cancelledCount = 0;
+    let awaitingSellerCount = 0;
+    let failedCount = 0;
+
+    for (const listing of expiredListings) {
+      let onChain: OnChainTicket;
+      try {
+        onChain = await this.stellar.verifyTicket(listing.ticket.chainTicketId);
+      } catch (err) {
+        failedCount++;
+        this.logger.warn(
+          `Could not read listing ${listing.id} on chain; will retry: ${(err as Error).message}`,
+        );
+        continue;
+      }
+
+      if (onChain.status === 'Resale') {
+        awaitingSellerCount++;
+        if (!listing.expiryNotifiedAt) {
+          await this.notifyExpiredListingSeller(listing);
+          await this.prisma.resaleListing.update({
+            where: { id: listing.id },
+            data: { expiryNotifiedAt: now },
+          });
+        }
+        continue;
+      }
+
+      await this.prisma.$transaction([
+        this.prisma.resaleListing.updateMany({
+          where: { id: listing.id, status: ResaleListingStatus.ACTIVE },
+          data: { status: ResaleListingStatus.CANCELLED },
+        }),
+        this.prisma.ticket.update({
+          where: { id: listing.ticketId },
+          data: { status: TICKET_STATUS_FOR_CHAIN[onChain.status] },
+        }),
+      ]);
+      cancelledCount++;
     }
 
-    const listingIds = expiredListings.map((l) => l.id);
-    const ticketIds = expiredListings.map((l) => l.ticketId);
+    return { cancelledCount, awaitingSellerCount, failedCount };
+  }
 
-    await this.prisma.$transaction([
-      this.prisma.resaleListing.updateMany({
-        where: { id: { in: listingIds } },
-        data: { status: ResaleListingStatus.CANCELLED },
-      }),
-      this.prisma.ticket.updateMany({
-        where: { id: { in: ticketIds } },
-        data: { status: TicketStatus.VALID },
-      }),
-    ]);
-
-    return { cancelledCount: expiredListings.length };
+  private async notifyExpiredListingSeller(listing: {
+    ticketId: string;
+    ticket: { id: string };
+    seller: { email: string; name: string };
+  }) {
+    if (!this.notifications) return;
+    const event = await this.prisma.ticket.findUnique({
+      where: { id: listing.ticketId },
+      select: { event: { select: { name: true } } },
+    });
+    try {
+      await this.notifications.sendResaleListingExpired({
+        to: listing.seller.email,
+        sellerName: listing.seller.name,
+        eventName: event?.event.name ?? 'your event',
+        ticketId: listing.ticket.id,
+      });
+    } catch (err) {
+      this.logger.warn(
+        `Could not email the seller of expired listing for ticket ${listing.ticketId}: ${(err as Error).message}`,
+      );
+    }
   }
 
   async buildCancelResaleTx(userId: string, ticketId: string) {
