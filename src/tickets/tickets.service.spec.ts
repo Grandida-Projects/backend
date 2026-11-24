@@ -1263,29 +1263,98 @@ describe('TicketsService', () => {
       });
     });
 
-    it('updates resale listing price and logs price audit history', async () => {
-      prisma.resaleListing.findUnique.mockResolvedValue({
+    describe('updateResalePrice re-lists on chain (#502)', () => {
+      const listing = {
         id: 'listing-1',
         sellerId: 'owner-1',
         status: 'ACTIVE',
         price: 1000n,
         ticket: {
+          chainTicketId: 7n,
           ticketType: { price: 1_000n },
           event: { maxResaleMultiplierBps: 20_000 },
         },
+      };
+      beforeEach(() => {
+        prisma.resaleListing.findUnique.mockResolvedValue(listing);
+        prisma.user.findUnique.mockResolvedValue({
+          id: 'owner-1',
+          stellarPublicKey: 'GOWNER',
+        });
       });
 
-      await service.updateResalePrice('owner-1', 'listing-1', '1500');
+      it('builds a list_for_resale at the new price for the seller to sign', async () => {
+        const result = await service.buildUpdateResalePriceTx(
+          'owner-1',
+          'listing-1',
+          '1500',
+        );
 
-      expect(prisma.resalePriceHistory.create).toHaveBeenCalledWith({
-        data: {
-          resaleListingId: 'listing-1',
+        expect(result).toEqual({ unsignedXdr: 'unsigned-xdr' });
+        expect(stellar.buildListForResaleTx).toHaveBeenCalledWith({
+          ownerPublicKey: 'GOWNER',
+          chainTicketId: 7n,
           price: 1500n,
-        },
+        });
       });
-      expect(prisma.resaleListing.update).toHaveBeenCalledWith({
-        where: { id: 'listing-1' },
-        data: { price: 1500n },
+
+      it('submits the re-listing and stores the price the chain recorded', async () => {
+        mockSignedCall('list_for_resale', ['GOWNER', 7n, 1500n]);
+        stellar.verifyTicket.mockResolvedValue({ resalePrice: 1500n });
+
+        await service.updateResalePrice(
+          'owner-1',
+          'listing-1',
+          '1500',
+          'signed-xdr',
+        );
+
+        expect(stellar.submitSignedTransaction).toHaveBeenCalledWith(
+          'signed-xdr',
+          expect.anything(),
+        );
+        expect(stellar.verifyTicket).toHaveBeenCalledWith(7n);
+        expect(prisma.resalePriceHistory.create).toHaveBeenCalledWith({
+          data: { resaleListingId: 'listing-1', price: 1500n },
+        });
+        expect(prisma.resaleListing.update).toHaveBeenCalledWith({
+          where: { id: 'listing-1' },
+          data: { price: 1500n },
+        });
+        expect(prisma.processedTx.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ operation: 'update-resale-price' }),
+          }),
+        );
+      });
+
+      it('rejects an envelope whose price differs from the body, before submitting', async () => {
+        mockSignedCall('list_for_resale', ['GOWNER', 7n, 1400n]);
+
+        await expect(
+          service.updateResalePrice(
+            'owner-1',
+            'listing-1',
+            '1500',
+            'signed-xdr',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
+        expect(prisma.resaleListing.update).not.toHaveBeenCalled();
+      });
+
+      it('rejects an envelope signed by someone other than the seller', async () => {
+        mockSignedCall('list_for_resale', ['GSTRANGER', 7n, 1500n]);
+
+        await expect(
+          service.updateResalePrice(
+            'owner-1',
+            'listing-1',
+            '1500',
+            'signed-xdr',
+          ),
+        ).rejects.toBeInstanceOf(BadRequestException);
+        expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
       });
     });
 
@@ -1897,15 +1966,33 @@ describe('TicketsService', () => {
       prisma.resaleListing.findUnique.mockResolvedValue(listingWithPricingInfo);
 
       await expect(
-        service.updateResalePrice('owner-1', 'listing-1', '1101'),
+        service.buildUpdateResalePriceTx('owner-1', 'listing-1', '1101'),
       ).rejects.toBeInstanceOf(BadRequestException);
+      await expect(
+        service.updateResalePrice('owner-1', 'listing-1', '1101', 'signed-xdr'),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(stellar.submitSignedTransaction).not.toHaveBeenCalled();
       expect(prisma.resaleListing.update).not.toHaveBeenCalled();
     });
 
     it('accepts a new price at the cap', async () => {
-      prisma.resaleListing.findUnique.mockResolvedValue(listingWithPricingInfo);
+      prisma.resaleListing.findUnique.mockResolvedValue({
+        ...listingWithPricingInfo,
+        ticket: { ...listingWithPricingInfo.ticket, chainTicketId: 7n },
+      });
+      prisma.user.findUnique.mockResolvedValue({
+        id: 'owner-1',
+        stellarPublicKey: 'GOWNER',
+      });
+      mockSignedCall('list_for_resale', ['GOWNER', 7n, 1100n]);
+      stellar.verifyTicket.mockResolvedValue({ resalePrice: 1100n });
 
-      await service.updateResalePrice('owner-1', 'listing-1', '1100');
+      await service.updateResalePrice(
+        'owner-1',
+        'listing-1',
+        '1100',
+        'signed-xdr',
+      );
 
       expect(prisma.resaleListing.update).toHaveBeenCalledWith({
         where: { id: 'listing-1' },
@@ -1920,7 +2007,7 @@ describe('TicketsService', () => {
       });
 
       await expect(
-        service.updateResalePrice('owner-1', 'listing-1', '900'),
+        service.updateResalePrice('owner-1', 'listing-1', '900', 'signed-xdr'),
       ).rejects.toBeInstanceOf(BadRequestException);
     });
 
@@ -1928,7 +2015,12 @@ describe('TicketsService', () => {
       prisma.resaleListing.findUnique.mockResolvedValue(listingWithPricingInfo);
 
       await expect(
-        service.updateResalePrice('someone-else', 'listing-1', '900'),
+        service.updateResalePrice(
+          'someone-else',
+          'listing-1',
+          '900',
+          'signed-xdr',
+        ),
       ).rejects.toBeInstanceOf(ForbiddenException);
     });
   });

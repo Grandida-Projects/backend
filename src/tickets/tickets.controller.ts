@@ -30,7 +30,10 @@ import { ConfirmSignedTxDto } from './dto/confirm-signed-tx.dto';
 import { ConfirmCheckInDto } from './dto/confirm-check-in.dto';
 import { ListForResaleDto } from './dto/list-for-resale.dto';
 import { ConfirmListForResaleDto } from './dto/confirm-list-for-resale.dto';
-import { UpdateResalePriceDto } from './dto/update-resale-price.dto';
+import {
+  ConfirmUpdateResalePriceDto,
+  UpdateResalePriceDto,
+} from './dto/update-resale-price.dto';
 import { ResaleListingsQueryDto } from './dto/resale-listings-query.dto';
 import { MyTicketsQueryDto } from './dto/my-tickets-query.dto';
 import { RevokeBatchDto } from './dto/revoke-batch.dto';
@@ -336,16 +339,33 @@ export class TicketsController {
     return this.ticketsService.getPriceHistory(listingId);
   }
 
+  /** #502 — builds the `list_for_resale` re-listing at the new price. */
+  @Post('resale/:listingId/price')
+  @UseInterceptors(IdempotencyInterceptor)
+  buildUpdateResalePriceTx(
+    @CurrentUser() user: CurrentUserPayload,
+    @Param('listingId') listingId: string,
+    @Body() dto: UpdateResalePriceDto,
+  ) {
+    return this.ticketsService.buildUpdateResalePriceTx(
+      user.userId,
+      listingId,
+      dto.price,
+    );
+  }
+
+  /** #502 — relays the signed re-listing and stores the on-chain price. */
   @Patch('resale/:listingId/price')
   updateResalePrice(
     @CurrentUser() user: CurrentUserPayload,
     @Param('listingId') listingId: string,
-    @Body() dto: UpdateResalePriceDto,
+    @Body() dto: ConfirmUpdateResalePriceDto,
   ) {
     return this.ticketsService.updateResalePrice(
       user.userId,
       listingId,
       dto.price,
+      dto.signedXdr,
     );
   }
 

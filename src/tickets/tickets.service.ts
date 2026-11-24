@@ -193,8 +193,7 @@ export class TicketsService {
     ticketTypeId: string,
     recipients: Array<{ toUserId: string; toPublicKey: string; seat?: string }>,
   ) {
-    const maxBatchSize =
-      this.config?.get<number>('ISSUE_BATCH_MAX_SIZE') ?? 50;
+    const maxBatchSize = this.config?.get<number>('ISSUE_BATCH_MAX_SIZE') ?? 50;
     if (recipients.length > maxBatchSize) {
       throw new BadRequestException(
         `Batch size exceeds the maximum of ${maxBatchSize} recipients`,
@@ -332,8 +331,10 @@ export class TicketsService {
     ]);
     // #211 — fail fast on duplicate assigned seats before touching the chain.
     await this.assertSeatAvailable(event.id, seat);
-    const { result, txHash } =
-      await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
+    const { result, txHash } = await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
     const chainTicketId = result as bigint;
 
     let ticket;
@@ -421,7 +422,10 @@ export class TicketsService {
       ['ticket', 1, ticket.chainTicketId],
       ['recipient', 2, toUser.stellarPublicKey],
     ]);
-    await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
+    await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
 
     // #375 — the chain is the source of truth for ownership: only record
     // toUserId once the on-chain owner is confirmed to be their wallet.
@@ -810,7 +814,10 @@ export class TicketsService {
       ['price', 2, BigInt(price)],
     ]);
 
-    const { txHash } = await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
+    const { txHash } = await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
     // #376 — store the price the chain actually recorded, not the body's.
     const { resalePrice } = await this.stellar.verifyTicket(
       ticket.chainTicketId,
@@ -847,7 +854,86 @@ export class TicketsService {
     }
   }
 
-  async updateResalePrice(userId: string, listingId: string, newPrice: string) {
+  /**
+   * #502 — step 1 of a price change: an unsigned `list_for_resale` at the new
+   * price. The contract allows re-listing a ticket it already has listed, so
+   * this replaces the on-chain `resale_price` once the seller signs it.
+   */
+  async buildUpdateResalePriceTx(
+    userId: string,
+    listingId: string,
+    newPrice: string,
+  ) {
+    const listing = await this.loadUpdatableListing(
+      userId,
+      listingId,
+      newPrice,
+    );
+    const owner = await this.getUserWithWallet(userId);
+    const unsignedXdr = await this.stellar.buildListForResaleTx({
+      ownerPublicKey: owner.stellarPublicKey!,
+      chainTicketId: listing.ticket.chainTicketId,
+      price: BigInt(newPrice),
+    });
+    return { unsignedXdr };
+  }
+
+  /**
+   * #502 — step 2: relays the signed re-listing, then stores the price the
+   * chain recorded. Changing only the DB price would show buyers one price
+   * while `buy_resale` charges another.
+   */
+  async updateResalePrice(
+    userId: string,
+    listingId: string,
+    newPrice: string,
+    signedXdr: string,
+  ) {
+    const replay = await this.findProcessedTx<ResaleListing>(signedXdr);
+    if (replay) return replay.value;
+    const listing = await this.loadUpdatableListing(
+      userId,
+      listingId,
+      newPrice,
+    );
+    const owner = await this.getUserWithWallet(userId);
+    this.assertSignedInvocation(signedXdr, 'list_for_resale', [
+      ['owner', 0, owner.stellarPublicKey],
+      ['ticket', 1, listing.ticket.chainTicketId],
+      ['price', 2, BigInt(newPrice)],
+    ]);
+    await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
+    const { resalePrice } = await this.stellar.verifyTicket(
+      listing.ticket.chainTicketId,
+    );
+
+    return this.prisma.$transaction(async (tx) => {
+      await tx.resalePriceHistory.create({
+        data: { resaleListingId: listingId, price: resalePrice },
+      });
+      const updated = await tx.resaleListing.update({
+        where: { id: listingId },
+        data: { price: resalePrice },
+      });
+      await this.recordProcessedTx(
+        tx,
+        signedXdr,
+        'update-resale-price',
+        updated,
+      );
+      return updated;
+    });
+  }
+
+  /** Shared checks for both price-change steps (#318, #319, #502). */
+  private async loadUpdatableListing(
+    userId: string,
+    listingId: string,
+    newPrice: string,
+  ) {
     const listing = await this.prisma.resaleListing.findUnique({
       where: { id: listingId },
       include: {
@@ -870,19 +956,7 @@ export class TicketsService {
       listing.ticket.ticketType.price,
       listing.ticket.event.maxResaleMultiplierBps,
     );
-
-    return this.prisma.$transaction(async (tx) => {
-      await tx.resalePriceHistory.create({
-        data: {
-          resaleListingId: listingId,
-          price: BigInt(newPrice),
-        },
-      });
-      return tx.resaleListing.update({
-        where: { id: listingId },
-        data: { price: BigInt(newPrice) },
-      });
-    });
+    return listing;
   }
 
   async getPriceHistory(listingId: string) {
@@ -951,7 +1025,10 @@ export class TicketsService {
       ['owner', 0, owner.stellarPublicKey],
       ['ticket', 1, ticket.chainTicketId],
     ]);
-    await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
+    await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
 
     return this.prisma.$transaction(async (tx) => {
       await tx.ticket.update({
@@ -989,7 +1066,10 @@ export class TicketsService {
       ['buyer', 0, buyer.stellarPublicKey],
       ['ticket', 1, ticket.chainTicketId],
     ]);
-    await this.stellar.submitSignedTransaction(signedXdr, this.attendeeSubmitOptions());
+    await this.stellar.submitSignedTransaction(
+      signedXdr,
+      this.attendeeSubmitOptions(),
+    );
 
     return this.prisma.$transaction(async (tx) => {
       await tx.resaleListing.updateMany({

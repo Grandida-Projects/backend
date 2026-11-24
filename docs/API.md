@@ -1485,22 +1485,49 @@ curl -s "$API/v1/tickets/resale/1e3c5a7b-9d0f-4b2c-8e4a-6f7a8b9c0d1f/price-histo
 ]
 ```
 
-#### `PATCH /v1/tickets/resale/:listingId/price`
+#### `POST /v1/tickets/resale/:listingId/price`
 
-Seller only, listing must be `ACTIVE`. Off-chain: records the new
-asking price and a history row.
+Step 1 of a price change (#502). Seller only, listing must be `ACTIVE`, new
+price within the event cap. Builds a `list_for_resale` call at the new price
+for the seller's wallet to sign; the contract accepts re-listing a ticket it
+already has listed, which replaces its on-chain `resale_price`.
 
 | field | type | rules |
 |---|---|---|
 | `price` | string | required, digits only, within the event cap |
 
 ```bash
-curl -s -X PATCH "$API/v1/tickets/resale/1e3c5a7b-9d0f-4b2c-8e4a-6f7a8b9c0d1f/price" \
+curl -s -X POST "$API/v1/tickets/resale/1e3c5a7b-9d0f-4b2c-8e4a-6f7a8b9c0d1f/price" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"price":"2600000"}'
 ```
 
-Returns the listing row with the new `price`.
+```json
+{ "unsignedXdr": "AAAAAgAA..." }
+```
+
+#### `PATCH /v1/tickets/resale/:listingId/price`
+
+Step 2. Relays the signed re-listing, then stores the price the chain
+recorded (from `verify_ticket`) on the listing, with a price-history row, so
+the marketplace never shows a different price from the one `buy_resale`
+charges. The same checks as step 1 apply, and the envelope's owner, ticket
+and price must match.
+
+| field | type | rules |
+|---|---|---|
+| `price` | string | required, digits only, within the event cap |
+| `signedXdr` | string | required |
+| `txHash` | string | optional, 64 hex characters |
+
+```bash
+curl -s -X PATCH "$API/v1/tickets/resale/1e3c5a7b-9d0f-4b2c-8e4a-6f7a8b9c0d1f/price" \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"price":"2600000","signedXdr":"AAAAAgAA..."}'
+```
+
+Returns the listing row with the new `price`. A body without `signedXdr` is
+a `400`: the price can no longer be changed in the database alone.
 
 #### `POST /v1/tickets/:ticketId/buy-resale`
 

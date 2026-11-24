@@ -57,6 +57,7 @@ describe('TicketsController', () => {
     buildListForResaleTx: jest.fn(),
     confirmListForResale: jest.fn(),
     getPriceHistory: jest.fn(),
+    buildUpdateResalePriceTx: jest.fn(),
     updateResalePrice: jest.fn(),
     cancelExpiredListings: jest.fn(),
     buildCancelResaleTx: jest.fn(),
@@ -105,6 +106,7 @@ describe('TicketsController', () => {
       'buildCheckInTx',
       'buildRevokeTx',
       'buildListForResaleTx',
+      'buildUpdateResalePriceTx',
       'buildCancelResaleTx',
       'buildBuyResaleTx',
     ] as const)('makes %s idempotent', (handler) => {
@@ -736,19 +738,44 @@ describe('TicketsController', () => {
       );
     });
 
-    it('PATCH /resale/:listingId/price updates the price and validates it', async () => {
+    it('POST /resale/:listingId/price builds the re-listing (#502)', async () => {
+      service.buildUpdateResalePriceTx.mockResolvedValue({ unsignedXdr: 'u' });
+      await http()
+        .post('/tickets/resale/l1/price')
+        .set(AUTH)
+        .send({ price: '900' })
+        .expect(201);
+      expect(service.buildUpdateResalePriceTx).toHaveBeenCalledWith(
+        uid,
+        'l1',
+        '900',
+      );
+    });
+
+    it('PATCH /resale/:listingId/price relays the signed re-listing and validates it', async () => {
       service.updateResalePrice.mockResolvedValue({ id: 'l1' });
       await http()
         .patch('/tickets/resale/l1/price')
         .set(AUTH)
-        .send({ price: '900' })
+        .send({ price: '900', signedXdr: 'AAAA' })
         .expect(200);
-      expect(service.updateResalePrice).toHaveBeenCalledWith(uid, 'l1', '900');
+      expect(service.updateResalePrice).toHaveBeenCalledWith(
+        uid,
+        'l1',
+        '900',
+        'AAAA',
+      );
 
       await http()
         .patch('/tickets/resale/l1/price')
         .set(AUTH)
-        .send({ price: 'x' })
+        .send({ price: 'x', signedXdr: 'AAAA' })
+        .expect(400);
+      // #502 — a DB-only price change is no longer possible.
+      await http()
+        .patch('/tickets/resale/l1/price')
+        .set(AUTH)
+        .send({ price: '900' })
         .expect(400);
     });
 

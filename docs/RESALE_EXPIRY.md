@@ -22,7 +22,7 @@ This document describes the resale marketplace enhancements implemented for resa
 
 - Every price set or updated on a resale listing is recorded in the `ResalePriceHistory` audit table.
 - Accessible via the `GET /tickets/resale/:listingId/price-history` endpoint.
-- Updated via the `PATCH /tickets/resale/:listingId/price` endpoint.
+- Updated on chain and then in the database: `POST /tickets/resale/:listingId/price` builds a `list_for_resale` at the new price, and `PATCH` with the signed envelope submits it and records the price the chain stored (#502).
 
 ## Limitations
 
