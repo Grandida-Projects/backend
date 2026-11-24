@@ -309,6 +309,9 @@ model ResaleListing {
   status       ResaleListingStatus  @default(ACTIVE)
   txHash       String?
   expiresAt    DateTime?
+  /// #503 — when the seller was asked to sign `cancel_resale` after
+  /// `expiresAt` passed while the ticket was still listed on chain.
+  expiryNotifiedAt DateTime?
   priceHistory ResalePriceHistory[]
   createdAt    DateTime             @default(now())
   updatedAt    DateTime             @updatedAt

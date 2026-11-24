@@ -1574,16 +1574,20 @@ curl -s -X POST "$API/v1/tickets/6f0a2c4e-8b1d-4f3a-9e5c-7d8e9f0a1b2c/confirm-ca
 
 #### `POST /v1/tickets/resale/cancel-expired`
 
-Sweeps `ACTIVE` listings whose `expiresAt` has passed: listing to
-`CANCELLED`, ticket back to `VALID`. The scheduler runs the same job;
-see [RESALE_EXPIRY.md](RESALE_EXPIRY.md).
+Sweeps `ACTIVE` listings whose `expiresAt` has passed, checking each
+against the chain (#503). A listing already delisted on chain becomes
+`CANCELLED`, and its ticket takes the on-chain status. A listing still live on
+chain stays `ACTIVE`/`RESALE`, and its seller is emailed once to sign
+`cancel_resale`. A listing whose chain state can't be read is retried next
+run. The scheduler runs the same job; see
+[RESALE_EXPIRY.md](RESALE_EXPIRY.md).
 
 ```bash
 curl -s -X POST "$API/v1/tickets/resale/cancel-expired" -H "Authorization: Bearer $TOKEN"
 ```
 
 ```json
-{ "cancelledCount": 3 }
+{ "cancelledCount": 2, "awaitingSellerCount": 1, "failedCount": 0 }
 ```
 
 ## Stellar

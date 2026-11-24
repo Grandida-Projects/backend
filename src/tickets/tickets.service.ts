@@ -52,6 +52,14 @@ function toStoredResponse(value: unknown): Prisma.InputJsonValue {
   ) as Prisma.InputJsonValue;
 }
 
+/** #503 — the cached `Ticket.status` for each on-chain ticket status. */
+const TICKET_STATUS_FOR_CHAIN: Record<OnChainTicket['status'], TicketStatus> = {
+  Valid: TicketStatus.VALID,
+  Used: TicketStatus.USED,
+  Revoked: TicketStatus.REVOKED,
+  Resale: TicketStatus.RESALE,
+};
+
 /** #501 — statuses `revokeBatch` may move to REVOKED. */
 const REVOCABLE_STATUSES: TicketStatus[] = [
   TicketStatus.VALID,
@@ -972,6 +980,20 @@ export class TicketsService {
     });
   }
 
+  /**
+   * #503 — expiry is a database-only concept: `list_for_resale` carries no
+   * expiry, so the contract keeps an expired listing live and only the
+   * seller can delist it with `cancel_resale`. Each expired listing is
+   * therefore checked against the chain:
+   *   - still `Resale` on chain: the database keeps it RESALE / ACTIVE (it
+   *     can still be bought), and the seller is asked once to sign
+   *     `cancel_resale`;
+   *   - no longer listed on chain: the listing is CANCELLED and the ticket
+   *     takes its on-chain status;
+   *   - the chain could not be read: nothing changes, and the next run
+   *     retries.
+   * So the database never reports VALID for a ticket the chain has listed.
+   */
   async cancelExpiredListings() {
     const now = new Date();
     const expiredListings = await this.prisma.resaleListing.findMany({
@@ -979,27 +1001,78 @@ export class TicketsService {
         status: ResaleListingStatus.ACTIVE,
         expiresAt: { lte: now },
       },
+      include: {
+        ticket: { select: { id: true, chainTicketId: true } },
+        seller: { select: { email: true, name: true } },
+      },
     });
 
-    if (expiredListings.length === 0) {
-      return { cancelledCount: 0 };
+    let cancelledCount = 0;
+    let awaitingSellerCount = 0;
+    let failedCount = 0;
+
+    for (const listing of expiredListings) {
+      let onChain: OnChainTicket;
+      try {
+        onChain = await this.stellar.verifyTicket(listing.ticket.chainTicketId);
+      } catch (err) {
+        failedCount++;
+        this.logger.warn(
+          `Could not read listing ${listing.id} on chain; will retry: ${(err as Error).message}`,
+        );
+        continue;
+      }
+
+      if (onChain.status === 'Resale') {
+        awaitingSellerCount++;
+        if (!listing.expiryNotifiedAt) {
+          await this.notifyExpiredListingSeller(listing);
+          await this.prisma.resaleListing.update({
+            where: { id: listing.id },
+            data: { expiryNotifiedAt: now },
+          });
+        }
+        continue;
+      }
+
+      await this.prisma.$transaction([
+        this.prisma.resaleListing.updateMany({
+          where: { id: listing.id, status: ResaleListingStatus.ACTIVE },
+          data: { status: ResaleListingStatus.CANCELLED },
+        }),
+        this.prisma.ticket.update({
+          where: { id: listing.ticketId },
+          data: { status: TICKET_STATUS_FOR_CHAIN[onChain.status] },
+        }),
+      ]);
+      cancelledCount++;
     }
 
-    const listingIds = expiredListings.map((l) => l.id);
-    const ticketIds = expiredListings.map((l) => l.ticketId);
+    return { cancelledCount, awaitingSellerCount, failedCount };
+  }
 
-    await this.prisma.$transaction([
-      this.prisma.resaleListing.updateMany({
-        where: { id: { in: listingIds } },
-        data: { status: ResaleListingStatus.CANCELLED },
-      }),
-      this.prisma.ticket.updateMany({
-        where: { id: { in: ticketIds } },
-        data: { status: TicketStatus.VALID },
-      }),
-    ]);
-
-    return { cancelledCount: expiredListings.length };
+  private async notifyExpiredListingSeller(listing: {
+    ticketId: string;
+    ticket: { id: string };
+    seller: { email: string; name: string };
+  }) {
+    if (!this.notifications) return;
+    const event = await this.prisma.ticket.findUnique({
+      where: { id: listing.ticketId },
+      select: { event: { select: { name: true } } },
+    });
+    try {
+      await this.notifications.sendResaleListingExpired({
+        to: listing.seller.email,
+        sellerName: listing.seller.name,
+        eventName: event?.event.name ?? 'your event',
+        ticketId: listing.ticket.id,
+      });
+    } catch (err) {
+      this.logger.warn(
+        `Could not email the seller of expired listing for ticket ${listing.ticketId}: ${(err as Error).message}`,
+      );
+    }
   }
 
   async buildCancelResaleTx(userId: string, ticketId: string) {

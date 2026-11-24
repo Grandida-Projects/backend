@@ -1373,22 +1373,129 @@ describe('TicketsService', () => {
       });
     });
 
-    it('cancels expired listings and restores ticket status to VALID', async () => {
-      prisma.resaleListing.findMany.mockResolvedValue([
-        { id: 'listing-exp-1', ticketId: 'ticket-exp-1' },
-        { id: 'listing-exp-2', ticketId: 'ticket-exp-2' },
-      ]);
-
-      const res = await service.cancelExpiredListings();
-
-      expect(res.cancelledCount).toBe(2);
-      expect(prisma.resaleListing.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['listing-exp-1', 'listing-exp-2'] } },
-        data: { status: 'CANCELLED' },
+    describe('cancelExpiredListings follows the chain (#503)', () => {
+      const expired = (n: number, extra: Record<string, unknown> = {}) => ({
+        id: `listing-exp-${n}`,
+        ticketId: `ticket-exp-${n}`,
+        expiryNotifiedAt: null,
+        ticket: { id: `ticket-exp-${n}`, chainTicketId: BigInt(n) },
+        seller: { email: `seller${n}@example.com`, name: `Seller ${n}` },
+        ...extra,
       });
-      expect(prisma.ticket.updateMany).toHaveBeenCalledWith({
-        where: { id: { in: ['ticket-exp-1', 'ticket-exp-2'] } },
-        data: { status: 'VALID' },
+      const notifications = { sendResaleListingExpired: jest.fn() };
+      beforeEach(() => {
+        notifications.sendResaleListingExpired
+          .mockReset()
+          .mockResolvedValue(undefined);
+        // The shared service is built without NotificationService.
+        (
+          service as unknown as { notifications: typeof notifications }
+        ).notifications = notifications;
+        prisma.ticket.findUnique.mockResolvedValue({
+          event: { name: 'Launch Night' },
+        });
+      });
+
+      it('keeps a listing that is still live on chain RESALE and asks the seller to cancel it', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([expired(1)]);
+        stellar.verifyTicket.mockResolvedValue({ status: 'Resale' });
+
+        const res = await service.cancelExpiredListings();
+
+        expect(res).toEqual({
+          cancelledCount: 0,
+          awaitingSellerCount: 1,
+          failedCount: 0,
+        });
+        expect(prisma.ticket.update).not.toHaveBeenCalled();
+        expect(prisma.resaleListing.updateMany).not.toHaveBeenCalled();
+        expect(notifications.sendResaleListingExpired).toHaveBeenCalledWith({
+          to: 'seller1@example.com',
+          sellerName: 'Seller 1',
+          eventName: 'Launch Night',
+          ticketId: 'ticket-exp-1',
+        });
+        expect(prisma.resaleListing.update).toHaveBeenCalledWith({
+          where: { id: 'listing-exp-1' },
+          data: { expiryNotifiedAt: expect.any(Date) },
+        });
+      });
+
+      it('asks the seller only once', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([
+          expired(1, { expiryNotifiedAt: new Date('2026-11-01T00:00:00Z') }),
+        ]);
+        stellar.verifyTicket.mockResolvedValue({ status: 'Resale' });
+
+        await service.cancelExpiredListings();
+
+        expect(notifications.sendResaleListingExpired).not.toHaveBeenCalled();
+        expect(prisma.resaleListing.update).not.toHaveBeenCalled();
+      });
+
+      it('cancels the listing and takes the chain status once it is delisted on chain', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([
+          expired(1),
+          expired(2),
+        ]);
+        stellar.verifyTicket
+          .mockResolvedValueOnce({ status: 'Valid' })
+          .mockResolvedValueOnce({ status: 'Used' });
+
+        const res = await service.cancelExpiredListings();
+
+        expect(res).toEqual({
+          cancelledCount: 2,
+          awaitingSellerCount: 0,
+          failedCount: 0,
+        });
+        expect(prisma.resaleListing.updateMany).toHaveBeenCalledWith({
+          where: { id: 'listing-exp-1', status: 'ACTIVE' },
+          data: { status: 'CANCELLED' },
+        });
+        expect(prisma.ticket.update).toHaveBeenCalledWith({
+          where: { id: 'ticket-exp-1' },
+          data: { status: 'VALID' },
+        });
+        expect(prisma.ticket.update).toHaveBeenCalledWith({
+          where: { id: 'ticket-exp-2' },
+          data: { status: 'USED' },
+        });
+      });
+
+      it('leaves a listing untouched when the chain cannot be read', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([
+          expired(1),
+          expired(2),
+        ]);
+        stellar.verifyTicket
+          .mockRejectedValueOnce(new Error('RPC unavailable'))
+          .mockResolvedValueOnce({ status: 'Valid' });
+
+        const res = await service.cancelExpiredListings();
+
+        expect(res).toEqual({
+          cancelledCount: 1,
+          awaitingSellerCount: 0,
+          failedCount: 1,
+        });
+        expect(prisma.ticket.update).toHaveBeenCalledTimes(1);
+        expect(prisma.ticket.update).toHaveBeenCalledWith({
+          where: { id: 'ticket-exp-2' },
+          data: { status: 'VALID' },
+        });
+      });
+
+      it('never marks a ticket VALID while the chain still has it listed', async () => {
+        prisma.resaleListing.findMany.mockResolvedValue([expired(1)]);
+        stellar.verifyTicket.mockResolvedValue({ status: 'Resale' });
+
+        await service.cancelExpiredListings();
+
+        expect(prisma.ticket.update).not.toHaveBeenCalledWith(
+          expect.objectContaining({ data: { status: 'VALID' } }),
+        );
+        expect(prisma.ticket.updateMany).not.toHaveBeenCalled();
       });
     });
   });

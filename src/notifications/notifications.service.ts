@@ -35,6 +35,23 @@ export class NotificationService {
     });
   }
 
+  /**
+   * #503 — an expired listing is still live on chain, where only the seller
+   * can delist it, so they are asked to sign `cancel_resale`.
+   */
+  sendResaleListingExpired(input: {
+    to: string;
+    sellerName: string;
+    eventName: string;
+    ticketId: string;
+  }): Promise<void> {
+    return this.provider.send({
+      to: input.to,
+      subject: `Your ${input.eventName} resale listing has expired`,
+      text: `Hi ${input.sellerName},\n\nYour resale listing for ${input.eventName} has passed its expiry time, but the ticket is still listed on chain and can still be bought. To take it off the market, cancel the listing from your wallet (cancel-resale for ticket ${input.ticketId}).\n`,
+    });
+  }
+
   sendTicketReceipt(input: {
     to: string;
     buyerName: string;
