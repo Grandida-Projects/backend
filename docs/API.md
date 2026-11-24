@@ -1354,10 +1354,20 @@ curl -s -X POST "$API/v1/tickets/events/7a1f3c5e-9b2d-4e6f-8a0c-1d2e3f4a5b6c/rev
 ```
 
 ```json
-{ "count": 2 }
+{
+  "count": 1,
+  "revokedIds": ["6f0a2c4e-8b1d-4f3a-9e5c-7d8e9f0a1b2c"],
+  "skipped": [
+    { "ticketId": "0d1e2f3a-4b5c-4d6e-8f7a-8b9c0d1e2f3a", "status": "USED" }
+  ]
+}
 ```
 
-`400` when any id is missing from the event or more than 100 are sent.
+Only `VALID` and `RESALE` tickets are revoked. Tickets that are already
+`REVOKED` or `USED` are left alone and listed in `skipped` with their status,
+and the `ticket.revoke_batch` audit entry records only the tickets actually
+revoked. `400` when any id is missing from the event or more than 100 are
+sent.
 
 ### Resale
 

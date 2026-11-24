@@ -52,6 +52,12 @@ function toStoredResponse(value: unknown): Prisma.InputJsonValue {
   ) as Prisma.InputJsonValue;
 }
 
+/** #501 — statuses `revokeBatch` may move to REVOKED. */
+const REVOCABLE_STATUSES: TicketStatus[] = [
+  TicketStatus.VALID,
+  TicketStatus.RESALE,
+];
+
 @Injectable()
 export class TicketsService {
   private readonly logger = new Logger(TicketsService.name);
@@ -667,6 +673,7 @@ export class TicketsService {
         id: { in: ticketIds },
         eventId,
       },
+      select: { id: true, status: true },
     });
 
     if (tickets.length !== ticketIds.length) {
@@ -675,16 +682,34 @@ export class TicketsService {
       );
     }
 
+    // #501 — only VALID and RESALE tickets can be revoked. Already revoked or
+    // used tickets are skipped and reported, so the audit log only records
+    // revocations that changed something.
+    const revocable = tickets.filter((t) =>
+      REVOCABLE_STATUSES.includes(t.status),
+    );
+    const revokedIds = revocable.map((t) => t.id);
+    const skipped = tickets
+      .filter((t) => !REVOCABLE_STATUSES.includes(t.status))
+      .map((t) => ({ ticketId: t.id, status: t.status }));
+
+    if (revokedIds.length === 0) {
+      return { count: 0, revokedIds, skipped };
+    }
+
     const result = await this.prisma.ticket.updateMany({
-      where: { id: { in: ticketIds } },
+      // The status condition is repeated so a ticket that changed after the
+      // read above is not revoked twice or resurrected from USED.
+      where: { id: { in: revokedIds }, status: { in: REVOCABLE_STATUSES } },
       data: { status: TicketStatus.REVOKED },
     });
     // #209 — audit batch revocation (one entry per batch).
     await this.audit?.record(userId, 'ticket.revoke_batch', 'Event', eventId, {
-      ticketIds,
+      ticketIds: revokedIds,
       count: result.count,
+      skipped,
     });
-    return result;
+    return { count: result.count, revokedIds, skipped };
   }
 
   private async assertWithinResaleLimit(userId: string) {
